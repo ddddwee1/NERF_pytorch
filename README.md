@@ -12,7 +12,7 @@ The speed is about 4-7 times faster than the original repo.
 Install the latest version of Pytorch (>=1.6.0), then 
 
 ```
-pip install torchsul imageio opencv-python 
+pip install torchsul imageio opencv-python matplotlib
 ```
 
 ## Get the data 
