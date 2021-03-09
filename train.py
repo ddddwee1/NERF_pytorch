@@ -16,8 +16,8 @@ def create_nerf():
     embeddirs_fn, input_chn_views = model.get_embedder(config.multires_views)
     skips = [4]
     net = model.get_nerf_model(config.net_depth, config.net_width, skips, input_chn, input_chn_views)
-    # net_fine = model.get_nerf_model(config.net_depth_fine, config.net_width_fine, skips, input_chn, input_chn_views)
-    return embed_fn, embeddirs_fn, net 
+    net_fine = model.get_nerf_model(config.net_depth_fine, config.net_width_fine, skips, input_chn, input_chn_views)
+    return embed_fn, embeddirs_fn, net, net_fine
 
 def get_rays(H, W, focal, c2w):
     i,j = np.meshgrid(np.arange(W, dtype=np.float32),
@@ -41,9 +41,40 @@ def raw2outputs(raw, z_vals, rays_d):
     weights = torch.cat([torch.ones_like(weights[...,:1]), weights[...,:-1]], dim=-1)
     weights = alpha * torch.cumprod( weights, dim=-1)
     rgb_map = torch.sum(weights[...,None] * rgb, dim=1)
-    return rgb_map
+    return rgb_map, weights
 
-def render_rays(rays_o, rays_d, viewdirs, near, far, embed_fn, embeddirs_fn, net):
+def sample_cdf(z_vals, weights, det=False):
+    bins = 0.5 * (z_vals[...,1:] + z_vals[...,:-1])
+    weights = weights + 1e-5 
+    pdf = weights / torch.sum(weights, -1, keepdim=True)
+    cdf = torch.cumsum(pdf, -1)
+    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)
+
+    if det:
+        u = torch.linspace(0., 1., config.N_samples)
+        u = torch.broadcast_to(u, list(cdf.shape[:-1])+[config.N_samples])
+    else:
+        u = torch.rand(cdf.shape[0], config.N_samples)
+    u = u.cuda(cdf.device)
+    
+    idxs = torch.searchsorted(cdf, u, right=True)
+    below = torch.maximum(torch.zeros_like(idxs), idxs-1).long()
+    above = torch.minimum(torch.ones_like(idxs)*(cdf.shape[-1]-1), idxs).long()
+
+    # idxs_g = torch.stack([below, above], -1)
+    cdf_below = torch.gather(cdf, dim=1, index=below)
+    cdf_above = torch.gather(cdf, dim=1, index=above)
+
+    bin_below = torch.gather(bins, dim=1, index=below)
+    bin_above = torch.gather(bins, dim=1, index=above)
+
+    denom = cdf_above - cdf_below
+    denom = torch.clamp(denom, 1e-5, 99999)
+    t = (u - cdf_below) / denom
+    samples = bin_below + t * (bin_above - bin_below)
+    return samples 
+
+def render_rays(rays_o, rays_d, viewdirs_in, near, far, embed_fn, embeddirs_fn, net, net_fine):
     # N_rays = rays_o.shape[0]
     t_vals = torch.linspace(0., 1., config.N_samples)
     z_vals = near * (1. - t_vals) + far * t_vals
@@ -56,9 +87,8 @@ def render_rays(rays_o, rays_d, viewdirs, near, far, embed_fn, embeddirs_fn, net
     z_vals = lower + rand
     z_vals = z_vals.cuda(rays_o.device)
     # get raw from embedder and network 
-    # print(rays_o.shape, rays_d.shape, z_vals.shape)
     pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., : , None]
-    viewdirs = viewdirs[:,None]
+    viewdirs = viewdirs_in[:,None]
     viewdirs = viewdirs.repeat(1, pts.shape[1], 1)
     # reshape them 
     shape_pts = pts.shape
@@ -67,13 +97,30 @@ def render_rays(rays_o, rays_d, viewdirs, near, far, embed_fn, embeddirs_fn, net
     viewdirs = viewdirs.reshape(-1, shape_dir[-1])
     embed_pts = embed_fn(pts)
     embed_dir = embeddirs_fn(viewdirs)
-    raw = net(embed_pts, embed_dir)
+    raw = net(embed_pts.detach(), embed_dir.detach())
     raw = raw.reshape(shape_pts[0], shape_pts[1], -1)
+    rgb_map0, weights0 = raw2outputs(raw, z_vals, rays_d)
+
+    # fine net
+    cdf_samples = sample_cdf(z_vals, weights0[...,1:-1].detach(), False) # from weight, get the cdf and do re-sampling 
+    z_vals, _ = torch.sort(torch.cat([z_vals, cdf_samples], -1), -1)
+    pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., : , None]
+    viewdirs = viewdirs_in[:,None]
+    viewdirs = viewdirs.repeat(1, pts.shape[1], 1)
+    # reshape them 
+    shape_pts = pts.shape
+    shape_dir = viewdirs.shape  
+    pts = pts.reshape(-1, shape_pts[-1])
+    viewdirs = viewdirs.reshape(-1, shape_dir[-1])
+    embed_pts = embed_fn(pts)
+    embed_dir = embeddirs_fn(viewdirs)
+    raw = net_fine(embed_pts.detach(), embed_dir.detach())
+    raw = raw.reshape(shape_pts[0], shape_pts[1], -1)
+    # raw = torch.ones_like(raw).cuda(raw.device)
+    rgb_map, weights = raw2outputs(raw, z_vals, rays_d)
+    return rgb_map0, rgb_map
     
-    rgb_map = raw2outputs(raw, z_vals, rays_d)
-    return rgb_map
-    
-def render(rays_o,rays_d, near, far, embed_fn, embeddirs_fn, net):
+def render(rays_o,rays_d, near, far, embed_fn, embeddirs_fn, net, net_fine):
     shape = rays_d.shape 
     viewdirs = rays_d
     viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
@@ -84,7 +131,7 @@ def render(rays_o,rays_d, near, far, embed_fn, embeddirs_fn, net):
     near = near * torch.ones(rays_o.shape[0], 1)
     far = far * torch.ones(rays_o.shape[0], 1)
     # all_ret = render_rays()
-    rgb_map = render_rays(rays_o, rays_d, viewdirs, near, far, embed_fn, embeddirs_fn, net)
+    rgb_map = render_rays(rays_o, rays_d, viewdirs, near, far, embed_fn, embeddirs_fn, net, net_fine)
     return rgb_map
 
 DATAPATH = './data/nerf_synthetic/lego'
@@ -113,13 +160,16 @@ else:
     pickle.dump(rays, open('rays.pkl','wb'))
 
 # train loop 
-embed_fn, embeddirs_fn, net = create_nerf()
+embed_fn, embeddirs_fn, net, net_fine = create_nerf()
 embed_fn.cuda()
 embeddirs_fn.cuda()
 net.cuda()
+net_fine.cuda()
 saver = M.Saver(net)
 saver.restore('./model/')
-optim = torch.optim.Adam(net.parameters(), 0.0005)
+saver_fine = M.Saver(net_fine)
+saver_fine.restore('./model_fine/')
+optim = torch.optim.Adam([{'params':net.parameters()}, {'params':net_fine.parameters()}], 0.0005)
 
 bar = tqdm(range(config.N_iters))
 for i in bar:
@@ -140,12 +190,14 @@ for i in bar:
     target_s = target[rand_idx_y, rand_idx_x]
 
     optim.zero_grad()
-    rgb = render(rays_o, rays_d, 2, 6, embed_fn, embeddirs_fn, net)
-    err = torch.pow(rgb-target_s, 2).mean()
+    rgb0, rgb = render(rays_o, rays_d, 2, 6, embed_fn, embeddirs_fn, net, net_fine)
+    err0 = torch.pow(rgb0-target_s, 2).mean()
+    err1 = torch.pow(rgb-target_s, 2).mean()
+    err = err0 + err1 
     err.backward()
     optim.step()
 
-    outstr = 'Ls: %.4f'%(err.cpu().detach().numpy())
+    outstr = 'LsCoarse: %.4f  LsFine: %.4f'%(err0.cpu().detach().numpy(), err1.cpu().detach().numpy())
     bar.set_description(outstr)
 
     if i%config.render_test_iter==0 and i>0:
@@ -160,7 +212,7 @@ for i in bar:
             with torch.no_grad():
                 rgb = []
                 for row in range(rays_o.shape[0]):
-                    rgb_row = render(rays_o[row], rays_d[row], 2, 6, embed_fn, embeddirs_fn, net)
+                    _, rgb_row = render(rays_o[row], rays_d[row], 2, 6, embed_fn, embeddirs_fn, net, net_fine)
                     rgb.append(rgb_row)
                 rgb = torch.stack(rgb, 0)
             rgb = rgb.cpu().numpy()
@@ -177,4 +229,6 @@ for i in bar:
 
     if i%config.save_interval==0 and i>0:
         saver.save('./model/%08d.pth'%i)
+        saver_fine.save('./model_fine/%08d.pth'%i)
 saver.save('./model/%08d.pth'%i)
+saver_fine.save('./model_fine/%08d.pth'%i)
